@@ -116,27 +116,38 @@ where
             });
         }
 
-        // Query whether the function has completed.
-        //
-        // Acquire is necessary so that the potential reading of data is ordered after this load.
-        match this.shared.state.load(atomic::Ordering::Acquire) {
-            // The function has not completed.
-            0 => {
-                this.shared.waker.register(cx.waker());
-                Poll::Pending
-            }
-            // The function has completed, take its output.
-            1 => {
-                // No specific ordering is required as there are no threads using the value
-                // anymore.
-                this.shared.state.store(2, atomic::Ordering::Relaxed);
+        let mut registered = false;
 
-                let res = ManuallyDrop::take(&mut (*this.shared.data.get()).output);
-                Poll::Ready(res.unwrap_or_else(|e| resume_unwind(e)))
+        loop {
+            // Query whether the function has completed.
+            //
+            // Acquire is necessary so that the potential reading of data is ordered after this load.
+            match this.shared.state.load(atomic::Ordering::Acquire) {
+                // The function has not completed yet and we are registered for wake up.
+                0 if registered => break Poll::Pending,
+
+                // The function has not completed yet; register us for wake up and try the
+                // above check again, to make sure that the task hasn't completed in
+                // between us checking and us registering the waker.
+                0 => {
+                    this.shared.waker.register(cx.waker());
+                    registered = true;
+                }
+
+                // The function has completed, take its output.
+                1 => {
+                    // No specific ordering is required as there are no threads using the value
+                    // anymore.
+                    this.shared.state.store(2, atomic::Ordering::Relaxed);
+
+                    let res = ManuallyDrop::take(&mut (*this.shared.data.get()).output);
+                    break Poll::Ready(res.unwrap_or_else(|e| resume_unwind(e)));
+                }
+
+                // Polled after completion.
+                2 => panic!("polled `Child` after completion"),
+                _ => unreachable!(),
             }
-            // Polled after completion.
-            2 => panic!("polled `Child` after completion"),
-            _ => unreachable!(),
         }
     }
     unsafe fn poll_cancel(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {

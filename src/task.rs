@@ -70,23 +70,33 @@ impl<O: Send + 'static> JoinHandle<O> {
                 let shared_ptr: *const Shared<F, O> = ptr.cast();
                 let shared = unsafe { &*shared_ptr };
 
-                // Query whether the function has completed.
-                //
-                // Acquire is necessary so that potential memory frees are ordered after this swap.
-                match shared.state.load(atomic::Ordering::Acquire) {
-                    // The function has not completed yet; register this task for wakeup.
-                    0 => {
-                        shared.waker.register(cx.waker());
-                        Poll::Pending
+                let mut registered = false;
+
+                loop {
+                    // Query whether the function has completed.
+                    //
+                    // Acquire is necessary so that potential memory frees are ordered after this swap.
+                    match shared.state.load(atomic::Ordering::Acquire) {
+                        // The function has not completed yet and we are registered for wake up.
+                        0 if registered => break Poll::Pending,
+
+                        // The function has not completed yet; register us for wake up and try the
+                        // above check again, to make sure that the task hasn't completed in
+                        // between us checking and us registering the waker.
+                        0 => {
+                            shared.waker.register(cx.waker());
+                            registered = true;
+                        }
+
+                        // The function has completed; take its output and free the shared state.
+                        2 => {
+                            let output =
+                                unsafe { ManuallyDrop::take(&mut (*shared.data.get()).output) };
+                            unsafe { Box::from_raw(shared_ptr as *mut Shared<F, O>) };
+                            break Poll::Ready(output);
+                        }
+                        _ => unreachable!(),
                     }
-                    // The function has completed; take its output and free the shared state.
-                    2 => {
-                        let output =
-                            unsafe { ManuallyDrop::take(&mut (*shared.data.get()).output) };
-                        unsafe { Box::from_raw(shared_ptr as *mut Shared<F, O>) };
-                        Poll::Ready(output)
-                    }
-                    _ => unreachable!(),
                 }
             },
             drop: |ptr| {
