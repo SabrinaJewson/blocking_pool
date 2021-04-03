@@ -170,6 +170,8 @@ impl<O: Debug, F: Debug> Debug for Child<O, F> {
 mod tests {
     use super::*;
 
+    use std::panic::panic_any;
+
     use completion::future;
 
     use crate::{wait, ThreadPool};
@@ -199,7 +201,7 @@ mod tests {
 
         let child = pool.spawn_child(|| {
             wait();
-            panic!(5_i16);
+            panic_any(5_i16);
         });
         let payload = catch_unwind(AssertUnwindSafe(|| future::block_on(child))).unwrap_err();
         assert_eq!(*payload.downcast::<i16>().unwrap(), 5);

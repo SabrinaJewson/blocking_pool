@@ -223,6 +223,7 @@ impl<O: Debug + Send + 'static> Debug for JoinHandle<O> {
 
 #[cfg(test)]
 mod tests {
+    use std::panic::panic_any;
     use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
 
     use completion::future;
@@ -265,7 +266,7 @@ mod tests {
     fn panic() {
         let pool = ThreadPool::new();
 
-        let handle = pool.spawn_task(|| panic!(5_i32));
+        let handle = pool.spawn_task(|| panic_any(5_i32));
         let payload = future::block_on(handle).unwrap_err();
         assert_eq!(*payload.downcast::<i32>().unwrap(), 5);
 
@@ -277,7 +278,7 @@ mod tests {
         struct DropPanic;
         impl Drop for DropPanic {
             fn drop(&mut self) {
-                panic!(5_i32);
+                panic_any(5_i32);
             }
         }
 
