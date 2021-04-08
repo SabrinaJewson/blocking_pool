@@ -15,3 +15,8 @@ completion-core = "0.2.0"
 
 [dev-dependencies]
 completion = "0.2.1"
+criterion = "0.3.4"
+
+[[bench]]
+name = "bench"
+harness = false
