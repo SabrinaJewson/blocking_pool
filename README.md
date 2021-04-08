@@ -46,15 +46,6 @@ before it is started.
 simply propagates them.
 - [`JoinHandle`] implements both [`Future`](core::future::Future) and [`CompletionFuture`],
 whereas [`Child`] only implements [`CompletionFuture`].
-- [`JoinHandle`] is [`Unpin`], whereas [`Child`] is `!`[`Unpin`]. This can make [`Child`]
-slightly harder to use.
-- [`Child`] has the type of the function being run as a generic parameter, whereas
-[`JoinHandle`] only has the output type of the function. This makes it difficult to store
-[`Child`] in structs, whereas [`JoinHandle`] can be stored easily.
-- [`JoinHandle`] has a mandatory heap allocation, whereas [`Child`] can be theoretically
-implemented without any heap allocations at all. Currently it still requires one due to
-temporary [limitations in Rust](https://github.com/rust-lang/rust/issues/63818).
-- Children are slightly faster than tasks due to less synchronization overhead needed.
 
 If you need to detach the function so that it runs in the background, use a task - otherwise,
 use a child.

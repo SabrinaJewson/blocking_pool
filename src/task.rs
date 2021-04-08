@@ -6,7 +6,7 @@ use std::future::Future;
 use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::Pin;
-use std::ptr;
+use std::ptr::NonNull;
 use std::sync::atomic::{self, AtomicU32};
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -19,11 +19,7 @@ use crate::RawFunction;
 
 /// The heap state shared between static join handles and the tasks.
 struct Shared<F, O> {
-    /// The state of the task.
-    ///
-    /// - `0`: The task is currently running, and the join handle has not been dropped.
-    /// - `1`: The task is currently running, and the join handle has been dropped.
-    /// - `2`: The task has finished.
+    /// The state of the task; see the `state_bits` module.
     state: AtomicU32,
 
     /// The function and output.
@@ -33,9 +29,128 @@ struct Shared<F, O> {
     waker: AtomicWaker,
 }
 
+/// Bits set in `Shared::state`.
+mod state_bits {
+    /// Bit set if the `JoinHandle` holds a reference to the `Shared`.
+    pub(super) const HANDLE_REF: u32 = 0b0001;
+
+    /// Bit set if the function holds a reference to `Shared`.
+    pub(super) const FUNCTION_REF: u32 = 0b0010;
+
+    /// Bit set when the function completes.
+    pub(super) const COMPLETE: u32 = 0b0100;
+
+    /// Bit set when the join handle is dropped.
+    pub(super) const DROPPED_HANDLE: u32 = 0b1000;
+}
+
 union FnData<F, O> {
     function: ManuallyDrop<F>,
     output: ManuallyDrop<thread::Result<O>>,
+}
+
+impl<F: FnOnce() -> O + Send + 'static, O: Send + 'static> Shared<F, O> {
+    /// Drop the `JoinHandle`'s reference to the `Shared`.
+    unsafe fn drop_handle_ref(self_ptr: *const Self) {
+        // Release is necessary to ensure that we don't use `Self` after marking it as freeable.
+        let old_state = (*self_ptr)
+            .state
+            .fetch_and(!state_bits::HANDLE_REF, atomic::Ordering::Release);
+
+        if old_state & state_bits::FUNCTION_REF == 0 {
+            // Make sure the other owner is done with `Self` so we can free it.
+            atomic::fence(atomic::Ordering::Acquire);
+            Box::from_raw(self_ptr as *mut Self);
+        }
+    }
+
+    /// Drop the function's reference to the `Shared`.
+    unsafe fn drop_function_ref(self_ptr: *const Self) {
+        // Release is necessary to ensure that we don't use `Self` after marking it as freeable.
+        let old_state = (*self_ptr)
+            .state
+            .fetch_and(!state_bits::FUNCTION_REF, atomic::Ordering::Release);
+
+        if old_state & state_bits::HANDLE_REF == 0 {
+            // Make sure the other owner is done with `Self` so we can free it.
+            atomic::fence(atomic::Ordering::Acquire);
+            Box::from_raw(self_ptr as *mut Self);
+        }
+    }
+
+    unsafe fn poll(self_ptr: *const Self, cx: &mut Context<'_>) -> Poll<thread::Result<O>> {
+        let this = &*self_ptr;
+
+        // Acquire is necessary so that if we read the function's output, it occurs after
+        // the load.
+        let complete = if this.state.load(atomic::Ordering::Acquire) & state_bits::COMPLETE != 0 {
+            true
+        } else {
+            this.waker.register(cx.waker());
+            this.state.load(atomic::Ordering::Acquire) & state_bits::COMPLETE != 0
+        };
+
+        if complete {
+            let output = ManuallyDrop::take(&mut (*this.data.get()).output);
+            Self::drop_handle_ref(self_ptr);
+            Poll::Ready(output)
+        } else {
+            Poll::Pending
+        }
+    }
+
+    unsafe fn drop_handle(self_ptr: *const Self) {
+        let this = &*self_ptr;
+
+        // Store that this join handle has been dropped.
+        //
+        // Acquire is necessary so that if we read the function's output, it occurs after
+        // the load.
+        let old_state = this
+            .state
+            .fetch_or(state_bits::DROPPED_HANDLE, atomic::Ordering::Acquire);
+
+        let _output = (old_state & state_bits::COMPLETE != 0).then(|| {
+            // Make sure to take the function's output to avoid leaks.
+            ManuallyDrop::take(&mut (*this.data.get()).output)
+        });
+
+        Self::drop_handle_ref(self_ptr);
+    }
+
+    unsafe fn run(self_ptr: *const Self) {
+        let this = &*self_ptr;
+
+        // SAFETY: The join handle will not access the data until we set its state
+        // to finished.
+        let data = &mut *this.data.get();
+
+        // Take the function and run it.
+        let function = ManuallyDrop::take(&mut data.function);
+        let output = catch_unwind(AssertUnwindSafe(function));
+
+        // Store the output of the function.
+        data.output = ManuallyDrop::new(output);
+
+        // Store that we are finished.
+        //
+        // Release is necessary so that the above storing of `data` is ordered before the
+        // `JoinHandle` can read it.
+        let old_state = this
+            .state
+            .fetch_or(state_bits::COMPLETE, atomic::Ordering::Release);
+
+        if old_state & state_bits::DROPPED_HANDLE != 0 {
+            // The handle has been dropped; we must drop the output ourselves to avoid a
+            // memory leak.
+            let _ = catch_unwind(AssertUnwindSafe(|| ManuallyDrop::drop(&mut data.output)));
+        } else {
+            // The handle still exists; wake it.
+            this.waker.wake();
+        }
+
+        Self::drop_function_ref(self_ptr);
+    }
 }
 
 /// A handle to a [spawned task](crate::ThreadPool::spawn_task).
@@ -44,18 +159,18 @@ union FnData<F, O> {
 /// task and have it run to completion on its own.
 pub struct JoinHandle<O: Send + 'static> {
     /// Type-erased pointer to a `Shared`.
-    ptr: *const (),
+    ptr: NonNull<()>,
     poll: unsafe fn(*const (), &mut Context<'_>) -> Poll<thread::Result<O>>,
     drop: unsafe fn(*const ()),
 }
 
 unsafe impl<O: Send + 'static> Send for JoinHandle<O> {}
-unsafe impl<O: Send + Sync + 'static> Sync for JoinHandle<O> {}
+unsafe impl<O: Send + 'static> Sync for JoinHandle<O> {}
 
 impl<O: Send + 'static> JoinHandle<O> {
     pub(crate) fn new<F: FnOnce() -> O + Send + 'static>(f: F, pool: &Arc<crate::Inner>) -> Self {
         let shared: Shared<F, O> = Shared {
-            state: AtomicU32::new(0),
+            state: AtomicU32::new(state_bits::HANDLE_REF | state_bits::FUNCTION_REF),
             data: UnsafeCell::new(FnData {
                 function: ManuallyDrop::new(f),
             }),
@@ -65,111 +180,13 @@ impl<O: Send + 'static> JoinHandle<O> {
         let ptr: *const () = Box::into_raw(Box::new(shared)).cast();
 
         let this = Self {
-            ptr,
-            poll: |ptr, cx| {
-                let shared_ptr: *const Shared<F, O> = ptr.cast();
-                let shared = unsafe { &*shared_ptr };
-
-                let mut registered = false;
-
-                loop {
-                    // Query whether the function has completed.
-                    //
-                    // Acquire is necessary so that potential memory frees are ordered after this swap.
-                    match shared.state.load(atomic::Ordering::Acquire) {
-                        // The function has not completed yet and we are registered for wake up.
-                        0 if registered => break Poll::Pending,
-
-                        // The function has not completed yet; register us for wake up and try the
-                        // above check again, to make sure that the task hasn't completed in
-                        // between us checking and us registering the waker.
-                        0 => {
-                            shared.waker.register(cx.waker());
-                            registered = true;
-                        }
-
-                        // The function has completed; take its output and free the shared state.
-                        2 => {
-                            let output =
-                                unsafe { ManuallyDrop::take(&mut (*shared.data.get()).output) };
-                            unsafe { Box::from_raw(shared_ptr as *mut Shared<F, O>) };
-                            break Poll::Ready(output);
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            },
-            drop: |ptr| {
-                let shared_ptr: *const Shared<F, O> = ptr.cast();
-                let shared = unsafe { &*shared_ptr };
-
-                // Store that this join handle has been dropped.
-                //
-                // - Acquire is necessary so that any potential memory frees are ordered after
-                // loading this value.
-                // - Release is necessary so that any accesses to `data` are ordered before the
-                // swap.
-                match shared.state.swap(1, atomic::Ordering::AcqRel) {
-                    // The function has't completed yet.
-                    0 => {}
-                    // The function has completed.
-                    2 => unsafe {
-                        // Make sure to drop its output to avoid leaks. Panics are fine, they will
-                        // just propagate to the caller.
-                        ManuallyDrop::drop(&mut (*shared.data.get()).output);
-                        // Free the shared state.
-                        Box::from_raw(shared_ptr as *mut Shared<F, O>);
-                    },
-                    _ => unreachable!(),
-                }
-            },
+            ptr: unsafe { NonNull::new_unchecked(ptr as *mut ()) },
+            poll: |ptr, cx| unsafe { <Shared<F, O>>::poll(ptr.cast(), cx) },
+            drop: |ptr| unsafe { <Shared<F, O>>::drop_handle(ptr.cast()) },
         };
         pool.spawn_raw_by_ref(RawFunction {
             data: ptr as *mut (),
-            run: |ptr| {
-                let shared_ptr: *const Shared<F, O> = ptr.cast();
-                let shared = unsafe { &*shared_ptr };
-
-                // SAFETY: The join handle will not access the data until we set its state
-                // to finished.
-                let data = unsafe { &mut *shared.data.get() };
-
-                // Take the function and run it.
-                let function = unsafe { ManuallyDrop::take(&mut data.function) };
-                let output = catch_unwind(AssertUnwindSafe(function));
-
-                // Store the output of the function.
-                *data = FnData {
-                    output: ManuallyDrop::new(output),
-                };
-
-                // Store that we are finished.
-                //
-                // - Acquire is necessary so that any potential memory frees are ordered after
-                // loading this value.
-                // - Release is necessary so that the above storing of `data` is ordered before
-                // the swap.
-                match shared.state.swap(2, atomic::Ordering::AcqRel) {
-                    // The join handle is waiting; notify it.
-                    0 => {
-                        let waker = shared.waker.take();
-                        if let Some(waker) = waker {
-                            waker.wake();
-                        }
-                    }
-
-                    // The join handle has been dropped.
-                    1 => unsafe {
-                        // Make sure to drop the output to avoid leaks.
-                        let _ =
-                            catch_unwind(AssertUnwindSafe(|| ManuallyDrop::drop(&mut data.output)));
-                        // Free the shared state.
-                        Box::from_raw(shared_ptr as *mut Shared<F, O>);
-                    },
-
-                    _ => unreachable!(),
-                }
-            },
+            run: |ptr| unsafe { <Shared<F, O>>::run(ptr.cast()) },
         });
 
         this
@@ -180,17 +197,14 @@ impl<O: Send + 'static> Future for JoinHandle<O> {
     type Output = thread::Result<O>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        if self.ptr.is_null() {
+        if self.ptr.as_ptr() as usize == 1 {
             panic!("Polled `JoinHandle` after completion");
         }
 
-        match unsafe { (self.poll)(self.ptr, cx) } {
-            Poll::Ready(output) => {
-                self.ptr = ptr::null();
-                Poll::Ready(output)
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        unsafe { (self.poll)(self.ptr.as_ptr(), cx) }.map(|output| {
+            self.ptr = unsafe { NonNull::new_unchecked(1 as *mut ()) };
+            output
+        })
     }
 }
 
@@ -207,15 +221,13 @@ impl<O: Send + 'static> CompletionFuture for JoinHandle<O> {
 
 impl<O: Send + 'static> Drop for JoinHandle<O> {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
-            unsafe {
-                (self.drop)(self.ptr);
-            }
+        if self.ptr.as_ptr() as usize != 1 {
+            unsafe { (self.drop)(self.ptr.as_ptr()) };
         }
     }
 }
 
-impl<O: Debug + Send + 'static> Debug for JoinHandle<O> {
+impl<O: Send + 'static> Debug for JoinHandle<O> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.pad("JoinHandle")
     }
