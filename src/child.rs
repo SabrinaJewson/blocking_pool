@@ -2,6 +2,7 @@
 
 use std::cell::UnsafeCell;
 use std::fmt::{self, Debug, Formatter};
+use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::pin::Pin;
@@ -164,15 +165,16 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
 ///
 /// This must be awaited on so that the child will complete.
 #[must_use = "Futures do nothing unless polled"]
-pub struct Child<O: Send> {
+pub struct Child<'a, O: Send> {
     /// Type-erased pointer to a `Shared`.
     ptr: NonNull<()>,
     /// This is a `&'static`, but that would enforce lifetime bounds on `O`.
     vtable: NonNull<VTable<O>>,
+    _lifetime: PhantomData<&'a ()>,
 }
 
-unsafe impl<O: Send> Send for Child<O> {}
-unsafe impl<O: Send> Sync for Child<O> {}
+unsafe impl<O: Send> Send for Child<'_, O> {}
+unsafe impl<O: Send> Sync for Child<'_, O> {}
 
 struct VTable<O> {
     poll: unsafe fn(*const (), &mut Context<'_>) -> Poll<thread::Result<O>>,
@@ -180,8 +182,8 @@ struct VTable<O> {
     drop: unsafe fn(*const ()),
 }
 
-impl<O: Send> Child<O> {
-    pub(crate) fn new<F: FnOnce() -> O + Send>(f: F, pool: Arc<crate::Inner>) -> Self {
+impl<'a, O: Send> Child<'a, O> {
+    pub(crate) fn new<F: FnOnce() -> O + Send + 'a>(f: F, pool: Arc<crate::Inner>) -> Self {
         let shared: Shared<F, O> = Shared {
             state: AtomicU32::new(state_bits::CHILD_REF | state_bits::FUNCTION_REF),
             pool: UnsafeCell::new(Some(pool)),
@@ -197,6 +199,7 @@ impl<O: Send> Child<O> {
         Self {
             ptr,
             vtable: NonNull::from(&<Shared<F, O>>::VTABLE),
+            _lifetime: PhantomData,
         }
     }
     unsafe fn poll_with<T>(
@@ -214,7 +217,7 @@ impl<O: Send> Child<O> {
     }
 }
 
-impl<O: Send> CompletionFuture for Child<O> {
+impl<O: Send> CompletionFuture for Child<'_, O> {
     type Output = O;
 
     unsafe fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -227,13 +230,13 @@ impl<O: Send> CompletionFuture for Child<O> {
     }
 }
 
-impl<O: Send> Debug for Child<O> {
+impl<O: Send> Debug for Child<'_, O> {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.pad("Child")
     }
 }
 
-impl<O: Send> Drop for Child<O> {
+impl<O: Send> Drop for Child<'_, O> {
     fn drop(&mut self) {
         if self.ptr.as_ptr() as usize != 1 {
             unsafe { (self.vtable.as_ref().drop)(self.ptr.as_ptr()) };

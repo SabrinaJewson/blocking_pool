@@ -285,9 +285,9 @@ impl ThreadPool {
     /// # Ok::<(), std::io::Error>(())
     /// # };
     /// ```
-    pub fn spawn_child<O, F>(&self, f: F) -> Child<O>
+    pub fn spawn_child<'a, O, F>(&self, f: F) -> Child<'a, O>
     where
-        F: FnOnce() -> O + Send,
+        F: FnOnce() -> O + Send + 'a,
         O: Send,
     {
         Child::new(f, Arc::clone(&self.inner))
