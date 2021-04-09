@@ -10,7 +10,6 @@ keywords = ["threadpool", "async"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-atomic-waker = "1.0.0"
 completion-core = "0.2.0"
 
 [dev-dependencies]

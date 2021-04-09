@@ -9,10 +9,9 @@ use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{self, AtomicU32};
 use std::sync::Arc;
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::thread;
 
-use atomic_waker::AtomicWaker;
 use completion_core::CompletionFuture;
 
 use crate::RawFunction;
@@ -26,22 +25,25 @@ struct Shared<F, O> {
     data: UnsafeCell<FnData<F, O>>,
 
     /// Waker woken when the task completes.
-    waker: AtomicWaker,
+    waker: UnsafeCell<Option<Waker>>,
 }
 
 /// Bits set in `Shared::state`.
 mod state_bits {
     /// Bit set if the `JoinHandle` holds a reference to the `Shared`.
-    pub(super) const HANDLE_REF: u32 = 0b0001;
+    pub(super) const HANDLE_REF: u32 = 0b00001;
 
     /// Bit set if the function holds a reference to `Shared`.
-    pub(super) const FUNCTION_REF: u32 = 0b0010;
+    pub(super) const FUNCTION_REF: u32 = 0b00010;
 
     /// Bit set when the function completes.
-    pub(super) const COMPLETE: u32 = 0b0100;
+    pub(super) const COMPLETE: u32 = 0b00100;
 
     /// Bit set when the join handle is dropped.
-    pub(super) const DROPPED_HANDLE: u32 = 0b1000;
+    pub(super) const DROPPED_HANDLE: u32 = 0b01000;
+
+    /// Bit set when either the function or the `JoinHandle` is currently using the `waker`.
+    pub(super) const WAKER_LOCKED: u32 = 0b10000;
 }
 
 union FnData<F, O> {
@@ -81,13 +83,33 @@ impl<F: FnOnce() -> O + Send + 'static, O: Send + 'static> Shared<F, O> {
     unsafe fn poll(self_ptr: *const Self, cx: &mut Context<'_>) -> Poll<thread::Result<O>> {
         let this = &*self_ptr;
 
-        // Acquire is necessary so that if we read the function's output, it occurs after
-        // the load.
-        let complete = if this.state.load(atomic::Ordering::Acquire) & state_bits::COMPLETE != 0 {
+        // Read the function state and attempt to lock the waker.
+        //
+        // Acquire is necessary so that if we read the function's output or store our waker, it
+        // occurs after the load.
+        let old_state = this
+            .state
+            .fetch_or(state_bits::WAKER_LOCKED, atomic::Ordering::Acquire);
+
+        let complete = if old_state & state_bits::COMPLETE != 0 {
             true
         } else {
-            this.waker.register(cx.waker());
-            this.state.load(atomic::Ordering::Acquire) & state_bits::COMPLETE != 0
+            // Register this waker for wakeup.
+
+            // The function shouldn't have locked the waker yet.
+            debug_assert_eq!(old_state & state_bits::WAKER_LOCKED, 0);
+
+            *this.waker.get() = Some(cx.waker().clone());
+
+            // Release the waker lock.
+            //
+            // Release ensures the above write to the waker happens-before the spawned function can
+            // read from it.
+            // Acquire ensures that if we read the function's output, it occurs after the load.
+            this.state
+                .fetch_and(!state_bits::WAKER_LOCKED, atomic::Ordering::AcqRel)
+                & state_bits::COMPLETE
+                != 0
         };
 
         if complete {
@@ -132,21 +154,33 @@ impl<F: FnOnce() -> O + Send + 'static, O: Send + 'static> Shared<F, O> {
         // Store the output of the function.
         data.output = ManuallyDrop::new(output);
 
-        // Store that we are finished.
+        // Store that we are finished and attempt to lock the waker.
         //
         // Release is necessary so that the above storing of `data` is ordered before the
         // `JoinHandle` can read it.
-        let old_state = this
-            .state
-            .fetch_or(state_bits::COMPLETE, atomic::Ordering::Release);
+        let old_state = this.state.fetch_or(
+            state_bits::COMPLETE | state_bits::WAKER_LOCKED,
+            atomic::Ordering::Release,
+        );
 
         if old_state & state_bits::DROPPED_HANDLE != 0 {
             // The handle has been dropped; we must drop the output ourselves to avoid a
             // memory leak.
             let _ = catch_unwind(AssertUnwindSafe(|| ManuallyDrop::drop(&mut data.output)));
-        } else {
-            // The handle still exists; wake it.
-            this.waker.wake();
+        } else if old_state & state_bits::WAKER_LOCKED == 0 {
+            // The handle has not been dropped, and we have acquired the waker lock.
+            //
+            // If we didn't acquire the waker lock, the handle is currently registering a new
+            // waker and will see that we have completed after finishing that, so we don't need to
+            // do anything.
+
+            acquire_fence!((*self_ptr).state);
+
+            if let Some(waker) = (*this.waker.get()).take() {
+                let _ = catch_unwind(|| waker.wake());
+            }
+            // We don't need to release the waker lock, because the waker is not going to used
+            // anymore.
         }
 
         Self::drop_function_ref(self_ptr);
@@ -174,7 +208,7 @@ impl<O: Send + 'static> JoinHandle<O> {
             data: UnsafeCell::new(FnData {
                 function: ManuallyDrop::new(f),
             }),
-            waker: AtomicWaker::new(),
+            waker: UnsafeCell::new(None),
         };
         // Heap-allocate and erase the shared state's type.
         let ptr: *const () = Box::into_raw(Box::new(shared)).cast();
