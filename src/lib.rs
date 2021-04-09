@@ -73,6 +73,20 @@ use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
+// TSan doesn't support fences; to avoid false positives perform a load instead.
+#[cfg(tsan)]
+macro_rules! acquire_fence {
+    ($x:expr) => {
+        $x.load(::std::sync::atomic::Ordering::Acquire);
+    };
+}
+#[cfg(not(tsan))]
+macro_rules! acquire_fence {
+    ($x:expr) => {
+        ::std::sync::atomic::fence(::std::sync::atomic::Ordering::Acquire);
+    };
+}
+
 mod task;
 pub use task::JoinHandle;
 

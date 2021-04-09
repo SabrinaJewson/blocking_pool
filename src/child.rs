@@ -68,7 +68,7 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
 
         if old_state & state_bits::FUNCTION_REF == 0 {
             // Make sure the other owner is done with `Self` so we can free it.
-            atomic::fence(atomic::Ordering::Acquire);
+            acquire_fence!((*self_ptr).state);
             Box::from_raw(self_ptr as *mut Self);
         }
     }
@@ -82,7 +82,7 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
 
         if old_state & state_bits::CHILD_REF == 0 {
             // Make sure the other owner is done with `Self` so we can free it.
-            atomic::fence(atomic::Ordering::Acquire);
+            acquire_fence!((*self_ptr).state);
             Box::from_raw(self_ptr as *mut Self);
         }
     }
