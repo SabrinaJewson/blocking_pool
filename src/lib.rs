@@ -10,9 +10,8 @@
 //! In comparison with [`blocking`](https://docs.rs/blocking), another crate that provides similar
 //! functionality, this crate uses a local thread pool instead of a global one. This allows for
 //! multiple thread pools to be created, and each one can be configured, allowing you to fine-tune
-//! your application for maximum speed. Also, this crate has support for [spawning blocking
-//! functions that borrow from the outer scope][spawn_child], which is not possible in
-//! `blocking`.
+//! your application for maximum speed. Also, this crate has support for spawning blocking
+//! functions that borrow from the outer scope, which is not possible in `blocking`.
 //!
 //! # Examples
 //!
@@ -24,47 +23,14 @@
 //! # completion::completion_async! {
 //! let pool = ThreadPool::new();
 //! let filename = "file.txt";
-//! let contents = pool.spawn_child(|| std::fs::read_to_string(&filename)).await?;
+//! let contents = pool.spawn(|| std::fs::read_to_string(&filename)).await?;
 //! println!("The contents of {} is: {}", filename, contents);
 //! # Ok::<(), std::io::Error>(())
 //! # };
 //! ```
 //!
-//!
-//! # Tasks and Children
-//!
-//! [Thread pools][ThreadPool] support two methods of running functions: tasks and children,
-//! spawned via [`spawn_task`][spawn_task] and [`spawn_child`][spawn_child] respectively. The most
-//! important difference is that tasks are required to live for `'static`, whereas children can have
-//! any lifetime, allowing them to borrow from the outer scope. The trade-off is that children
-//! cannot be detached to run independently of the outer scope; once you start one, you must see it
-//! to completion straight after.
-//!
-//! There are also a few smaller differences between the two:
-//! - Tasks are spawned immediately, whereas children require the returned [`Child`][Child] to be
-//! polled before it is started.
-//! - [`JoinHandle`][JoinHandle] will catch panics and return an [`Err`][Err] if your function
-//! panicked. [`Child`][Child] simply propagates them.
-//! - [`JoinHandle`][JoinHandle] implements both [`Future`][Future] and
-//! [`CompletionFuture`][CompletionFuture], whereas [`Child`][Child] only implements
-//! [`CompletionFuture`][CompletionFuture].
-//!
-//! If you need to detach the function so that it runs in the background, use a task - otherwise,
-//! use a child.
-//!
-//! [ThreadPool]: https://docs.rs/blocking_pool/*/blocking_pool/struct.ThreadPool.html
-//! [spawn_child]: https://docs.rs/blocking_pool/*/blocking_pool/struct.ThreadPool.html#method.spawn_child
-//! [Child]: https://docs.rs/blocking_pool/*/blocking_pool/struct.Child.html
-//! [spawn_task]: https://docs.rs/blocking_pool/*/blocking_pool/struct.ThreadPool.html#method.spawn_task
-//! [JoinHandle]: https://docs.rs/blocking_pool/*/blocking_pool/struct.JoinHandle.html
-//!
-//! [CompletionFuture]: https://docs.rs/completion-core/0.2/completion_core/trait.CompletionFuture.html
-//!
 //! [std read_to_string]: https://doc.rust-lang.org/stable/std/fs/fn.read_to_string.html
-//! [Err]: https://doc.rust-lang.org/stable/core/result/enum.Result.html#variant.Err
-//! [Future]: https://doc.rust-lang.org/stable/core/future/trait.Future.html
 #![warn(missing_debug_implementations, missing_docs)]
-#![cfg_attr(miri, allow(non_fmt_panic))]
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
@@ -88,10 +54,7 @@ macro_rules! acquire_fence {
 }
 
 mod task;
-pub use task::JoinHandle;
-
-mod child;
-pub use child::Child;
+pub use task::*;
 
 /// A thread pool.
 ///
@@ -99,7 +62,8 @@ pub use child::Child;
 /// need to wrap it in an [`Arc`] or similar type.
 ///
 /// When dropped, the destructor won't block but the thread pool itself will continue to run and
-/// process tasks.
+/// process tasks. You can call [`ThreadPool::wait_all_complete`] to wait for all the active tasks
+/// to complete.
 #[derive(Debug, Clone)]
 pub struct ThreadPool {
     inner: Arc<Inner>,
@@ -225,22 +189,6 @@ impl Inner {
         drop(handle);
     }
 
-    fn spawn_raw_by_ref(self: &Arc<Self>, raw: RawFunction) {
-        let mut locked = self.locked.lock().unwrap();
-
-        locked.work.push_back(raw);
-
-        if locked.sleeping_threads == 0 {
-            if let Some(new_spawnable) = locked.spawnable.checked_sub(1) {
-                locked.spawnable = new_spawnable;
-                drop(locked);
-                Arc::clone(self).start_thread();
-            }
-        } else {
-            self.thread_condvar.notify_one();
-        }
-    }
-
     fn spawn_raw(self: Arc<Self>, raw: RawFunction) {
         let mut locked = self.locked.lock().unwrap();
 
@@ -272,31 +220,10 @@ impl ThreadPool {
         Builder::new()
     }
 
-    /// Spawn a task on this thread pool.
+    /// Spawn a blocking task onto this thread pool.
     ///
-    /// See [Tasks and Children](index.html#tasks-and-children) for more information on the
-    /// difference between this and [`spawn_child`](Self::spawn_child).
-    ///
-    /// # Examples
-    ///
-    /// Use [`std::fs::write`] in asynchronous code:
-    ///
-    /// ```no_run
-    /// let pool = blocking_pool::ThreadPool::new();
-    /// pool.spawn_task(|| std::fs::write("foo.txt", "Lorem ipsum"));
-    /// ```
-    pub fn spawn_task<O, F>(&self, f: F) -> JoinHandle<O>
-    where
-        F: FnOnce() -> O + Send + 'static,
-        O: Send + 'static,
-    {
-        JoinHandle::new(f, &self.inner)
-    }
-
-    /// Spawn a child on this thread pool.
-    ///
-    /// See [Tasks and Children](index.html#tasks-and-children) for more information on the
-    /// difference between this and [`spawn_task`](Self::spawn_task).
+    /// The returned future will not make progress until polled for the first time. To start it
+    /// running immediately, you can call [`Task::detach`].
     ///
     /// # Examples
     ///
@@ -306,16 +233,16 @@ impl ThreadPool {
     /// # completion::completion_async! {
     /// let pool = blocking_pool::ThreadPool::new();
     /// let data = "Lorem ipsum".to_owned();
-    /// pool.spawn_child(|| std::fs::write("foo.txt", &data)).await?;
+    /// pool.spawn(|| std::fs::write("foo.txt", &data)).await?;
     /// # Ok::<(), std::io::Error>(())
     /// # };
     /// ```
-    pub fn spawn_child<'a, O, F>(&self, f: F) -> Child<'a, O>
+    pub fn spawn<'a, O, F>(&self, f: F) -> Task<'a, O>
     where
         F: FnOnce() -> O + Send + 'a,
         O: Send,
     {
-        Child::new(f, Arc::clone(&self.inner))
+        Task::new(f, Arc::clone(&self.inner))
     }
 
     /// Wait for all the running and queued tasks in the thread pool to complete.
@@ -327,7 +254,7 @@ impl ThreadPool {
     ///
     /// let pool = blocking_pool::ThreadPool::new();
     ///
-    /// pool.spawn_task(|| std::thread::sleep(Duration::from_secs(3)));
+    /// pool.spawn(|| std::thread::sleep(Duration::from_secs(3))).detach();
     ///
     /// let start = Instant::now();
     /// pool.wait_all_complete();
@@ -355,7 +282,7 @@ impl ThreadPool {
     /// let pool = blocking_pool::ThreadPool::new();
     ///
     /// // This will start up a thread that will linger around even after the task is finished.
-    /// pool.spawn_child(|| {}).await;
+    /// pool.spawn(|| {}).await;
     ///
     /// // This will forcibly kill that thread.
     /// pool.prune();
@@ -519,17 +446,17 @@ mod tests {
         let value: AtomicUsize = AtomicUsize::new(0);
 
         future::block_on(future::zip((
-            thread_pool.spawn_child(|| {
+            thread_pool.spawn(|| {
                 assert_eq!(value.load(SeqCst), 0);
                 wait();
                 assert!(value.fetch_add(1, SeqCst) < 2);
             }),
-            thread_pool.spawn_child(|| {
+            thread_pool.spawn(|| {
                 assert_eq!(value.load(SeqCst), 0);
                 wait();
                 assert!(value.fetch_add(1, SeqCst) < 2);
             }),
-            thread_pool.spawn_child(|| {
+            thread_pool.spawn(|| {
                 assert!(matches!(value.load(SeqCst), 1 | 2));
                 wait();
                 assert_eq!(value.load(SeqCst), 2);
