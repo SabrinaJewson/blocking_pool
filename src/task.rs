@@ -5,7 +5,7 @@ use std::fmt::{self, Debug, Formatter};
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem::{self, ManuallyDrop};
-use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+use std::panic;
 use std::pin::Pin;
 use std::ptr::NonNull;
 use std::sync::atomic::{self, AtomicU32};
@@ -122,9 +122,8 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
     ///
     /// This is called by `Task::drop`.
     unsafe fn drop_handle_not_started(self_ptr: *const Self) {
-        let self_ptr = self_ptr as *mut Self;
-        ManuallyDrop::drop(&mut (*self_ptr).data.get_mut().function);
-        Box::from_raw(self_ptr);
+        let mut this = Box::from_raw(self_ptr as *mut Self);
+        ManuallyDrop::drop(&mut this.data.get_mut().function);
     }
 
     /// Start the blocking task if it hasn't been started already.
@@ -162,9 +161,9 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
             // The function shouldn't have locked the waker yet.
             debug_assert_eq!(old_state & state_bits::WAKER_LOCKED, 0);
 
-            // Store our new waker. `catch_unwind` is used because we don't want the `Task` or
+            // Store our new waker. `ignore_unwind` is used because we don't want the `Task` or
             // `JoinHandle` to panic before the task is finished.
-            let _ = catch_unwind(AssertUnwindSafe(|| {
+            ignore_unwind(panic::AssertUnwindSafe(|| {
                 *this.waker.get() = Some(cx.waker().clone());
             }));
 
@@ -218,7 +217,7 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
 
         // Take the function and run it.
         let function = ManuallyDrop::take(&mut data.function);
-        let output = catch_unwind(AssertUnwindSafe(function));
+        let output = panic::catch_unwind(panic::AssertUnwindSafe(function));
 
         // Store the output of the function.
         data.output = ManuallyDrop::new(output);
@@ -234,7 +233,9 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
         if old_state & state_bits::DROPPED_HANDLE != 0 {
             // The handle has been dropped; we must drop the output ourselves to avoid a
             // memory leak.
-            let _ = catch_unwind(AssertUnwindSafe(|| ManuallyDrop::drop(&mut data.output)));
+            ignore_unwind(panic::AssertUnwindSafe(|| {
+                ManuallyDrop::drop(&mut data.output)
+            }));
         } else if old_state & state_bits::WAKER_LOCKED == 0 {
             // The handle has not been dropped, and we have acquired the waker lock.
             //
@@ -245,7 +246,7 @@ impl<F: FnOnce() -> O + Send, O: Send> Shared<F, O> {
             acquire_fence!((*self_ptr).state);
 
             if let Some(waker) = (*this.waker.get()).take() {
-                let _ = catch_unwind(|| waker.wake());
+                ignore_unwind(|| waker.wake());
             }
             // We don't need to release the waker lock, because the waker is not going to used
             // anymore.
@@ -287,6 +288,7 @@ const TASK_COMPLETE: NonNull<()> = unsafe { NonNull::new_unchecked(1 as *mut ())
 ///
 /// This can be awaited on to wait for the task to complete, or [`detach()`](Self::detach) can be
 /// called to run the task in the background.
+#[must_use = "Tasks will not run unless polled. To run it in the background, use `Task::detach`"]
 pub struct Task<'a, O: Send> {
     /// Type-erased pointer to a `Shared`, or `TASK_COMPLETE` if the task is finished.
     ptr: NonNull<()>,
@@ -326,7 +328,7 @@ impl<'a, O: Send> Task<'a, O> {
         }
         (poll)(self.ptr.as_ptr(), cx).map(|output| {
             self.ptr = TASK_COMPLETE;
-            output.unwrap_or_else(|panic| resume_unwind(panic))
+            output.unwrap_or_else(|panic| panic::resume_unwind(panic))
         })
     }
 }
@@ -439,6 +441,20 @@ impl<O: Send + 'static> Drop for JoinHandle<O> {
     }
 }
 
+/// Run a closure, ignoring any panics that occur.
+fn ignore_unwind<F: FnOnce() + panic::UnwindSafe>(f: F) {
+    struct AbortOnDrop;
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            std::process::abort();
+        }
+    }
+    // If the panic payload itself panics on drop, we simply abort the process.
+    let guard = AbortOnDrop;
+    drop(panic::catch_unwind(f));
+    mem::forget(guard);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,7 +549,8 @@ mod tests {
             wait();
             panic_any(5_i16);
         });
-        let payload = catch_unwind(AssertUnwindSafe(|| future::block_on(task))).unwrap_err();
+        let payload =
+            panic::catch_unwind(panic::AssertUnwindSafe(|| future::block_on(task))).unwrap_err();
         assert_eq!(*payload.downcast::<i16>().unwrap(), 5);
 
         pool.miri_shutdown();
