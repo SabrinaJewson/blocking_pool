@@ -1,65 +1,22 @@
 //! A thread pool for running synchronous I/O in asynchronous applications.
 //!
-//! In asynchronous code, blocking the thread - that is calling some function which takes a long
-//! time to return - is a very bad idea. It will prevent all the other asynchronous tasks from
-//! running, and can cause all sorts of undesirable behaviour. However, sometimes blocking calls
-//! are needed; for example many libraries are not built with `async`, but you might want to use
-//! them in an `async` context. The solution is to have a thread pool where blocking code can be
-//! offloaded to, so that it doesn't block the main asynchronous threads.
-//!
-//! In comparison with [`blocking`](https://docs.rs/blocking), another crate that provides similar
-//! functionality, this crate uses a local thread pool instead of a global one. This allows for
-//! multiple thread pools to be created, and each one can be configured, allowing you to fine-tune
-//! your application for maximum speed. Also, this crate has support for spawning blocking
-//! functions that borrow from the outer scope, which is not possible in `blocking`.
-//!
-//! # Examples
-//!
-//! Call [`std::fs::read_to_string`][std read_to_string] from asynchronous code:
-//!
-//! ```no_run
-//! use blocking_pool::ThreadPool;
-//!
-//! # completion::completion_async! {
-//! let pool = ThreadPool::new();
-//! let filename = "file.txt";
-//! let contents = pool.spawn(|| std::fs::read_to_string(&filename)).await?;
-//! println!("The contents of {} is: {}", filename, contents);
-//! # Ok::<(), std::io::Error>(())
-//! # };
-//! ```
-//!
-//! [std read_to_string]: https://doc.rust-lang.org/stable/std/fs/fn.read_to_string.html
+//! This crate is low-level, and is meant to be used as a building block for higher level
+//! asynchronous runtimes.
 #![warn(missing_debug_implementations, missing_docs)]
 
 use std::borrow::Cow;
 use std::collections::VecDeque;
+use std::mem;
+use std::panic;
 use std::sync::Arc;
 use std::sync::{Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
-// TSan doesn't support fences; to avoid false positives perform a load instead.
-#[cfg(tsan)]
-macro_rules! acquire_fence {
-    ($x:expr) => {
-        $x.load(::std::sync::atomic::Ordering::Acquire);
-    };
-}
-#[cfg(not(tsan))]
-macro_rules! acquire_fence {
-    ($x:expr) => {
-        ::std::sync::atomic::fence(::std::sync::atomic::Ordering::Acquire);
-    };
-}
-
-mod task;
-pub use task::*;
-
 /// A thread pool.
 ///
-/// This can be cheaply cloned to create more handles to the same thread pool, so there is never any
-/// need to wrap it in an [`Arc`] or similar type.
+/// This can be cheaply cloned to create more handles to the same thread pool, so there is no need
+/// to wrap it in an [`Arc`] or similar type.
 ///
 /// When dropped, the destructor won't block but the thread pool itself will continue to run and
 /// process tasks. You can call [`ThreadPool::wait_all_complete`] to wait for all the active tasks
@@ -127,7 +84,7 @@ impl Inner {
                 drop(locked);
 
                 // Catching unwinds is done inside the function itself.
-                (f.run)(f.data);
+                unsafe { (f.run)(f.data) };
 
                 locked = self.locked.lock().unwrap();
                 locked.workers -= 1;
@@ -188,22 +145,6 @@ impl Inner {
         #[cfg(not(miri))]
         drop(handle);
     }
-
-    fn spawn_raw(self: Arc<Self>, raw: RawFunction) {
-        let mut locked = self.locked.lock().unwrap();
-
-        locked.work.push_back(raw);
-
-        if locked.sleeping_threads == 0 {
-            if let Some(new_spawnable) = locked.spawnable.checked_sub(1) {
-                locked.spawnable = new_spawnable;
-                drop(locked);
-                self.start_thread();
-            }
-        } else {
-            self.thread_condvar.notify_one();
-        }
-    }
 }
 
 impl ThreadPool {
@@ -220,29 +161,61 @@ impl ThreadPool {
         Builder::new()
     }
 
-    /// Spawn a blocking task onto this thread pool.
+    /// Raw API for spawning a function on the thread pool.
     ///
-    /// The returned future will not make progress until polled for the first time. To start it
-    /// running immediately, you can call [`Task::detach`].
+    /// This will call the given function pointer with the provided `data` pointer on the blocking
+    /// thread pool at some point in the future.
+    ///
+    /// # Safety
+    ///
+    /// When called with the provided data pointer from another thread, the `run` function must not
+    /// cause UB or panic.
+    pub unsafe fn spawn_raw<T>(&self, data: *const T, run: unsafe fn(*const T)) {
+        let raw = RawFunction {
+            data: data.cast(),
+            run: mem::transmute::<unsafe fn(*const T), unsafe fn(*const ())>(run),
+        };
+
+        let mut locked = self.inner.locked.lock().unwrap();
+        locked.work.push_back(raw);
+
+        if locked.sleeping_threads == 0 {
+            if let Some(new_spawnable) = locked.spawnable.checked_sub(1) {
+                locked.spawnable = new_spawnable;
+                drop(locked);
+                self.inner.clone().start_thread();
+            }
+        } else {
+            self.inner.thread_condvar.notify_one();
+        }
+    }
+
+    /// Spawn a boxed closure on the thread pool.
     ///
     /// # Examples
     ///
-    /// Use [`std::fs::write`] in asynchronous code:
-    ///
     /// ```no_run
-    /// # completion::completion_async! {
     /// let pool = blocking_pool::ThreadPool::new();
-    /// let data = "Lorem ipsum".to_owned();
-    /// pool.spawn(|| std::fs::write("foo.txt", &data)).await?;
-    /// # Ok::<(), std::io::Error>(())
-    /// # };
+    /// pool.spawn_boxed(Box::new(|| println!("Hello world")));
     /// ```
-    pub fn spawn<'a, O, F>(&self, f: F) -> Task<'a, O>
-    where
-        F: FnOnce() -> O + Send + 'a,
-        O: Send,
-    {
-        Task::new(f, Arc::clone(&self.inner))
+    pub fn spawn_boxed<F: FnOnce() + Send + 'static>(&self, f: Box<F>) {
+        unsafe {
+            self.spawn_raw(Box::into_raw(f), |f| {
+                struct AbortOnDrop;
+                impl Drop for AbortOnDrop {
+                    fn drop(&mut self) {
+                        std::process::abort();
+                    }
+                }
+                // Make sure that panic payloads panicking on drop don't get propagated.
+                let guard = AbortOnDrop;
+
+                let f = Box::from_raw(f as *mut F);
+                let _ = panic::catch_unwind(panic::AssertUnwindSafe(f));
+
+                mem::forget(guard);
+            })
+        };
     }
 
     /// Wait for all the running and queued tasks in the thread pool to complete.
@@ -254,7 +227,7 @@ impl ThreadPool {
     ///
     /// let pool = blocking_pool::ThreadPool::new();
     ///
-    /// pool.spawn(|| std::thread::sleep(Duration::from_secs(3))).detach();
+    /// pool.spawn_boxed(Box::new(|| std::thread::sleep(Duration::from_secs(3))));
     ///
     /// let start = Instant::now();
     /// pool.wait_all_complete();
@@ -278,15 +251,13 @@ impl ThreadPool {
     /// # Examples
     ///
     /// ```
-    /// # completion::future::block_on(completion::completion_async! {
     /// let pool = blocking_pool::ThreadPool::new();
     ///
     /// // This will start up a thread that will linger around even after the task is finished.
-    /// pool.spawn(|| {}).await;
+    /// pool.spawn_boxed(Box::new(|| {}));
     ///
     /// // This will forcibly kill that thread.
     /// pool.prune();
-    /// # });
     /// ```
     pub fn prune(&self) {
         let mut locked = self.inner.locked.lock().unwrap();
@@ -427,7 +398,7 @@ impl Default for Builder {
 #[derive(Debug)]
 struct RawFunction {
     data: *const (),
-    run: fn(*const ()),
+    run: unsafe fn(*const ()),
 }
 unsafe impl Send for RawFunction {}
 
@@ -437,31 +408,30 @@ mod tests {
 
     use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 
-    use completion::future;
-
     #[test]
     fn more_work_than_threads() {
         let thread_pool = Builder::new().max_threads(2).build();
 
         let value: AtomicUsize = AtomicUsize::new(0);
+        let value: &'static AtomicUsize = unsafe { &*(&value as *const AtomicUsize) };
 
-        future::block_on(future::zip((
-            thread_pool.spawn(|| {
-                assert_eq!(value.load(SeqCst), 0);
-                wait();
-                assert!(value.fetch_add(1, SeqCst) < 2);
-            }),
-            thread_pool.spawn(|| {
-                assert_eq!(value.load(SeqCst), 0);
-                wait();
-                assert!(value.fetch_add(1, SeqCst) < 2);
-            }),
-            thread_pool.spawn(|| {
-                assert!(matches!(value.load(SeqCst), 1 | 2));
-                wait();
-                assert_eq!(value.load(SeqCst), 2);
-            }),
-        )));
+        thread_pool.spawn_boxed(Box::new(move || {
+            assert_eq!(value.load(SeqCst), 0);
+            wait();
+            assert!(value.fetch_add(1, SeqCst) < 2);
+        }));
+        thread_pool.spawn_boxed(Box::new(move || {
+            assert_eq!(value.load(SeqCst), 0);
+            wait();
+            assert!(value.fetch_add(1, SeqCst) < 2);
+        }));
+        thread_pool.spawn_boxed(Box::new(move || {
+            assert!(matches!(value.load(SeqCst), 1 | 2));
+            wait();
+            assert_eq!(value.load(SeqCst), 2);
+        }));
+
+        thread_pool.wait_all_complete();
 
         assert_eq!(value.load(SeqCst), 2);
 
