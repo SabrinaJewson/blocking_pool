@@ -1,6 +1,6 @@
 [package]
 name = "blocking_pool"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["KaiJewson <kai.jewson@gmail.com>"]
 edition = "2018"
 description = "A thread pool for running synchronous I/O in asynchronous applications"
