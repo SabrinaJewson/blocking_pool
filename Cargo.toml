@@ -1,16 +1,14 @@
 [package]
 name = "blocking_pool"
 version = "0.2.0"
-authors = ["KaiJewson <kai.jewson@gmail.com>"]
 edition = "2018"
 description = "A thread pool for running synchronous I/O in asynchronous applications"
-repository = "https://github.com/KaiJewson/blocking_pool"
+repository = "https://github.com/SabrinaJewson/blocking_pool"
 license = "MIT OR Apache-2.0"
 keywords = ["threadpool", "async"]
 categories = ["asynchronous", "concurrency"]
 
 [dependencies]
-completion-core = "0.2.0"
 
 [dev-dependencies]
 criterion = "0.3.4"
