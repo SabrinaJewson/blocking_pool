@@ -1,8 +1,7 @@
 # blocking_pool
 
-A thread pool for running synchronous I/O in asynchronous applications.
+A dynamically-sized thread pool for running blocking I/O in the background.
 
-This crate is low-level, and is meant to be used as a building block for higher level
-asynchronous runtimes.
+This crate is useful for both synchronous programs and in building async runtimes.
 
 License: MIT OR Apache-2.0

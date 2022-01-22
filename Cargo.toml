@@ -2,7 +2,7 @@
 name = "blocking_pool"
 version = "0.2.0"
 edition = "2018"
-description = "A thread pool for running synchronous I/O in asynchronous applications"
+description = "A dynamically-sized thread pool for running blocking I/O in the background"
 repository = "https://github.com/SabrinaJewson/blocking_pool"
 license = "MIT OR Apache-2.0"
 keywords = ["threadpool", "async"]

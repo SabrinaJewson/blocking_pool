@@ -1,17 +1,16 @@
-//! A thread pool for running synchronous I/O in asynchronous applications.
+//! A dynamically-sized thread pool for running blocking I/O in the background.
 //!
-//! This crate is low-level, and is meant to be used as a building block for higher level
-//! asynchronous runtimes.
+//! This crate is useful for both synchronous programs and in building async runtimes.
 #![warn(missing_debug_implementations, missing_docs)]
 
-use std::borrow::Cow;
-use std::collections::VecDeque;
-use std::mem;
-use std::panic;
-use std::sync::Arc;
-use std::sync::{Condvar, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::{
+    borrow::Cow,
+    collections::VecDeque,
+    mem, panic,
+    sync::{Arc, Condvar, Mutex},
+    thread,
+    time::Duration,
+};
 
 /// A thread pool.
 ///
